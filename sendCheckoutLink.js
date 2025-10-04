@@ -39,7 +39,7 @@ export async function sendCheckoutLink({ orderId, finalTotalJpy, phoneE164, expi
   const session = await stripe.checkout.sessions.create(params, { idempotencyKey: idemKey });
 
   const body = [
-    `【everytime.jp】ご注文 #${orderId} のお支払いリンクです`,
+    `【ニコパフ専門ならニコハブ】ご注文 #${orderId} のお支払いリンク（ストライプ）です`,
     `合計：¥${finalTotalJpy}（税込）`,
     session.url,
     `※リンクの有効期限は24時間です`
