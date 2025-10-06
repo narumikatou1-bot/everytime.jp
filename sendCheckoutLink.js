@@ -57,7 +57,7 @@ export async function sendCheckoutLink({ orderId, finalTotalJpy, phoneE164, expi
 
   // 英数・短文（1セグメント狙い）
   const body = [
-    `NICOHUB ご注文 #${orderId} 決済URL↓`,
+    `ご注文 #${orderId} 決済URL↓`,
     `${urlForSms}`,
     `合計: JPY ${amountJpy} 有効24h`
   ].join('\n');
