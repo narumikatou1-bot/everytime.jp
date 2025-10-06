@@ -57,9 +57,9 @@ export async function sendCheckoutLink({ orderId, finalTotalJpy, phoneE164, expi
 
   // 英数・短文（1セグメント狙い）
   const body = [
-    `NICOHUB ご注文 #${orderId}`,
-    `決済リンク: ${urlForSms}`,
-    `合計: JPY ${amountJpy} / リンク期限：24時間`
+    `NICOHUB ご注文 #${orderId} 決済URL↓`,
+    `${urlForSms}`,
+    `合計: JPY ${amountJpy} 有効24h`
   ].join('\n');
 
   try { await twilioClient().messages.create(smsParams(phoneE164, body)); }
