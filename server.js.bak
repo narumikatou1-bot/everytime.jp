@@ -3,12 +3,11 @@ import express from 'express';
 import Stripe from 'stripe';
 import cors from 'cors';
 import { sendCheckoutLink } from './sendCheckoutLink.js';
-import { resolveShort, isAllowedTarget } from './shortener.js';
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-/* ========== 1) Webhook (raw) — 順序重要！ ========== */
+// Webhook（順序が超重要：rawで受ける）
 app.post('/webhooks/stripe', express.raw({ type: 'application/json' }), async (req, res) => {
   try {
     const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
@@ -20,7 +19,7 @@ app.post('/webhooks/stripe', express.raw({ type: 'application/json' }), async (r
         const session = event.data.object;
         const orderId = session.client_reference_id;
         console.log('[Webhook] checkout.session.completed order=', orderId);
-        // TODO: 必要なら WooCommerce を REST API で更新
+        // TODO: 注文を「支払い済み」に更新。必要なら完了SMS/メール送信。
         break;
       }
       case 'checkout.session.expired': {
@@ -37,34 +36,18 @@ app.post('/webhooks/stripe', express.raw({ type: 'application/json' }), async (r
   }
 });
 
-/* ========== 2) その他は JSON でOK ========== */
+// それ以外は JSON でOK
 app.use(express.json());
 
-/* ========== 3) /api に CORS 許可（WP フロントから叩く用） ========== */
+// WordPress から叩く前提で /api は CORS 許可
 app.use('/api', cors({
-  origin: ['https://everytime.jp', 'https://www.everytime.jp'],
+  origin: ['https://everytime.jp','https://www.everytime.jp'],
   methods: ['GET','POST']
 }));
 
-/* ========== 4) 健康チェック ========== */
 app.get('/health', (_req, res) => res.send('ok'));
 
-/* ========== 5) 短URL → Stripe へ302 ========== */
-app.get('/p/:token', async (req, res) => {
-  try {
-    const token = String(req.params.token || '');
-    const target = await resolveShort(token);
-    if (!target) return res.status(410).send('Link expired or invalid.');
-    if (!isAllowedTarget(target)) return res.status(400).send('Invalid target');
-    res.set('Cache-Control', 'no-store');
-    return res.redirect(302, target);
-  } catch (e) {
-    console.error('[Short Redirect Error]', e);
-    return res.status(500).send('Server error');
-  }
-});
-
-/* ========== 6) 支払いリンク発行 → SMS送信 ========== */
+// 支払いリンク発行→SMS送信
 app.post('/api/orders/:orderId/send-payment', async (req, res) => {
   try {
     const { orderId } = req.params;

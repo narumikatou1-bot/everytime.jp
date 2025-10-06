@@ -1,9 +1,9 @@
 import 'dotenv/config';
 import Stripe from 'stripe';
 import twilio from 'twilio';
-import { createShort } from './shortener.js';
 
 function need(name){ const v=process.env[name]; if(!v) throw new Error(`${name} is missing in .env`); return v; }
+
 function twilioClient(){ return twilio(need('TWILIO_ACCOUNT_SID'), need('TWILIO_AUTH_TOKEN')); }
 function smsParams(to, body){
   if (process.env.TWILIO_MESSAGING_SERVICE_SID) return { to, body, messagingServiceSid: process.env.TWILIO_MESSAGING_SERVICE_SID };
@@ -19,10 +19,6 @@ export async function sendCheckoutLink({ orderId, finalTotalJpy, phoneE164, expi
   const stripe = new Stripe(need('STRIPE_SECRET_KEY'));
   const appBase = need('APP_BASE_URL');
 
-  // 24h 以内で期限を設定（Stripeの最大は24h）
-  const now = Math.floor(Date.now() / 1000);
-  const expiresAt = Math.min(now + (expiresInSec || 24*60*60), now + 24*60*60);
-
   const params = {
     mode: 'payment',
     line_items: [{
@@ -31,39 +27,26 @@ export async function sendCheckoutLink({ orderId, finalTotalJpy, phoneE164, expi
     }],
     success_url: `${appBase}/payment/success?order=${encodeURIComponent(orderId)}`,
     cancel_url:  `${appBase}/payment/cancel?order=${encodeURIComponent(orderId)}`,
-    client_reference_id: String(orderId),
-    expires_at: expiresAt
+    client_reference_id: String(orderId)
   };
+  if (expiresInSec) {
+    const now = Math.floor(Date.now()/1000);
+    params.expires_at = Math.min(now + expiresInSec, now + 86400);
+  }
 
-  // 重複作成防止（同額・同注文IDなら同一キー）
+  // 二重作成防止（同じ注文でも金額が変われば新規扱い）
   const idemKey = `order-${orderId}-${finalTotalJpy}`;
   const session = await stripe.checkout.sessions.create(params, { idempotencyKey: idemKey });
 
-  // 短縮URL（Upstash）を作成。失敗時は長URLを使う
-  let shortUrl = null;
-  try {
-    const ttlSec = Math.max(60, session.expires_at - Math.floor(Date.now()/1000));
-    const token  = await createShort(session.url, ttlSec);
-    if (token) {
-      const base = (process.env.APP_SHORT_BASE_URL || process.env.APP_BASE_URL).replace(/\/$/, '');
-      shortUrl = `${base}/p/${token}`;
-    }
-  } catch (e) {
-    console.warn('[Shortener] fallback to long url:', e.message);
-  }
-
-  const urlForSms = shortUrl || session.url;
-  const amountJpy = new Intl.NumberFormat('en-US').format(finalTotalJpy);
-
-  // 英数・短文（1セグメント狙い）
   const body = [
-    `everytime.jp Order #${orderId}`,
-    `Pay: ${urlForSms}`,
-    `Total: JPY ${amountJpy} / exp: 24h`
+    `【everytime.jp】ご注文 #${orderId} のお支払いリンクです`,
+    `合計：¥${finalTotalJpy}（税込）`,
+    session.url,
+    `※リンクの有効期限は24時間です`
   ].join('\n');
 
   try { await twilioClient().messages.create(smsParams(phoneE164, body)); }
   catch (err) { if (err?.code === 21608) throw new Error('Twilio trial restriction: recipient number is not verified (code 21608)'); throw err; }
 
-  return urlForSms;
+  return session.url;
 }
