@@ -46,7 +46,7 @@ export async function sendCheckoutLink({ orderId, finalTotalJpy, phoneE164, expi
     const token  = await createShort(session.url, ttlSec);
     if (token) {
       const base = (process.env.APP_SHORT_BASE_URL || process.env.APP_BASE_URL).replace(/\/$/, '');
-      shortUrl = `${base}/p/${token}`;
+      shortUrl = `${base}/1/${token}`;
     }
   } catch (e) {
     console.warn('[Shortener] fallback to long url:', e.message);
