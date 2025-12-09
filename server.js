@@ -40,7 +40,7 @@ async function createCheckoutSession({ orderId, finalTotalJpy, expiresInSec }) {
     line_items: [{
       price_data: {
         currency: 'jpy',
-        product_data: { name: Order #${orderId} },
+        product_data: { name: `Order #${orderId}` },
         unit_amount: finalTotalJpy,
       },
       quantity: 1,
@@ -67,13 +67,13 @@ const UPSTASH_TOKEN = process.env.UPSTASH_REDIS_REST_TOKEN;
 async function saveShort(token, target, ttlSec = 60 * 60 * 24) {
   if (!UPSTASH_BASE || !UPSTASH_TOKEN) return;
   const url = `${UPSTASH_BASE}/set/${encodeURIComponent(token)}/${encodeURIComponent(target)}?EX=${ttlSec}`;
-  const r = await fetch(url, { method: 'POST', headers: { Authorization: Bearer ${UPSTASH_TOKEN} } });
+  const r = await fetch(url, { method: 'POST', headers: { Authorization: `Bearer ${UPSTASH_TOKEN}` } });
   if (!r.ok) throw new Error('UPSTASH_SET_FAILED');
 }
 async function loadShort(token) {
   if (!UPSTASH_BASE || !UPSTASH_TOKEN) return null;
   const r = await fetch(`${UPSTASH_BASE}/get/${encodeURIComponent(token)}`, {
-    headers: { Authorization: Bearer ${UPSTASH_TOKEN} }
+    headers: { Authorization: `Bearer ${UPSTASH_TOKEN}` }
   });
   if (!r.ok) return null;
   const js = await r.json();
