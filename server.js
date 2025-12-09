@@ -1,89 +1,57 @@
-// server.js
-// .env を最初に読む
+// 1) .env を "最初に" 読み込む（これが超重要）
 import 'dotenv/config';
 
 import express from 'express';
 import Stripe from 'stripe';
-import crypto from 'crypto';
+import { sendCheckoutLink } from './sendCheckoutLink.js';
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// ---- helpers ------------------------------------------------
-function assertEnv(name) {
+// Stripe SDK（Webhook検証にも使う）
+const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
+
+/* ---------------- WooCommerce REST helpers ---------------- */
+
+function mustEnv(name) {
   const v = process.env[name];
-  if (!v) throw new Error(`${name} is missing in env`);
+  if (!v) throw new Error(`${name} is required`);
   return v;
 }
-const stripe = new Stripe(assertEnv('STRIPE_SECRET_KEY'));
+const WC_BASE_URL = mustEnv('WC_BASE_URL');         // 例: https://everytime.jp
+const WC_CK = mustEnv('WC_CONSUMER_KEY');           // Woo API Key (Read/Write)
+const WC_CS = mustEnv('WC_CONSUMER_SECRET');
 
-// APIキー保護 (WordPress→Render の内部呼び出し用)
-function apiKeyGuard(req, res, next) {
-  const key = req.header('X-API-KEY');
-  if (!key || key !== process.env.INTERNAL_API_KEY) {
-    return res.status(401).json({ ok: false, error: 'UNAUTHORIZED' });
-  }
-  next();
+function wcUrl(path) {
+  const u = new URL(`${WC_BASE_URL.replace(/\/$/, '')}/wp-json/wc/v3${path}`);
+  u.searchParams.set('consumer_key', WC_CK);
+  u.searchParams.set('consumer_secret', WC_CS);
+  return u.toString();
 }
 
-// Checkoutセッション作成（共通関数）
-async function createCheckoutSession({ orderId, finalTotalJpy, expiresInSec }) {
-  if (!orderId) throw new Error('MISSING_ORDER_ID');
-  if (!Number.isInteger(finalTotalJpy) || finalTotalJpy <= 0) {
-    throw new Error('INVALID_AMOUNT_JPY_INTEGER_REQUIRED');
+async function wcGetOrder(orderId) {
+  const r = await fetch(wcUrl(`/orders/${orderId}`));
+  if (!r.ok) {
+    const t = await r.text();
+    throw new Error(`Woo GET ${orderId} failed: ${r.status} ${t.slice(0,200)}`);
   }
+  return r.json();
+}
 
-  const appBase = assertEnv('APP_BASE_URL'); // 例: https://everytime.jp
-
-  const params = {
-    mode: 'payment',
-    line_items: [{
-      price_data: {
-        currency: 'jpy',
-        product_data: { name: `Order #${orderId}` },
-        unit_amount: finalTotalJpy,
-      },
-      quantity: 1,
-    }],
-    success_url: `${appBase}/payment/success?order=${encodeURIComponent(orderId)}&cs={CHECKOUT_SESSION_ID}`,
-    cancel_url:  `${appBase}/payment/cancel?order=${encodeURIComponent(orderId)}`,
-    client_reference_id: String(orderId),
-  };
-  if (expiresInSec) {
-    const now = Math.floor(Date.now()/1000);
-    params.expires_at = Math.min(now + expiresInSec, now + 60*60*24);
-  }
-
-  const session = await stripe.checkout.sessions.create(params, {
-    idempotencyKey: `order-${orderId}`, // 二重発行対策
+async function wcUpdateOrderStatus(orderId, status) {
+  const r = await fetch(wcUrl(`/orders/${orderId}`), {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ status }),
   });
-
-  return { url: session.url, sessionId: session.id };
+  if (!r.ok) {
+    const t = await r.text();
+    throw new Error(`Woo PUT ${orderId} failed: ${r.status} ${t.slice(0,200)}`);
+  }
+  return r.json();
 }
 
-// --- Upstash(任意): 短縮URL（/p/:token） -----------------------
-const UPSTASH_BASE = process.env.UPSTASH_REDIS_REST_URL;
-const UPSTASH_TOKEN = process.env.UPSTASH_REDIS_REST_TOKEN;
-async function saveShort(token, target, ttlSec = 60 * 60 * 24) {
-  if (!UPSTASH_BASE || !UPSTASH_TOKEN) return;
-  const url = `${UPSTASH_BASE}/set/${encodeURIComponent(token)}/${encodeURIComponent(target)}?EX=${ttlSec}`;
-  const r = await fetch(url, { method: 'POST', headers: { Authorization: `Bearer ${UPSTASH_TOKEN}` } });
-  if (!r.ok) throw new Error('UPSTASH_SET_FAILED');
-}
-async function loadShort(token) {
-  if (!UPSTASH_BASE || !UPSTASH_TOKEN) return null;
-  const r = await fetch(`${UPSTASH_BASE}/get/${encodeURIComponent(token)}`, {
-    headers: { Authorization: `Bearer ${UPSTASH_TOKEN}` }
-  });
-  if (!r.ok) return null;
-  const js = await r.json();
-  return js.result || null;
-}
-function issueToken(n = 6) { // 6〜8文字程度でOK
-  return crypto.randomBytes(n).toString('base64url');
-}
-
-// ---------------- Stripe Webhook（必ず raw を先に） --------------
+/* ---------------- Stripe Webhook（必ず最初に raw で定義） ---------------- */
 app.post(
   '/webhooks/stripe',
   express.raw({ type: 'application/json' }),
@@ -91,111 +59,100 @@ app.post(
     try {
       const sig = req.headers['stripe-signature'];
       const event = stripe.webhooks.constructEvent(
-        req.body,
+        req.body, // ← raw body
         sig,
-        assertEnv('STRIPE_WEBHOOK_SECRET')
+        process.env.STRIPE_WEBHOOK_SECRET
       );
 
       switch (event.type) {
         case 'checkout.session.completed': {
           const session = event.data.object;
-          const orderId = session.client_reference_id;
-          console.log('[Webhook] checkout.session.completed order=', orderId);
-          // TODO: DBを「支払い済み」に更新
+          const orderId = parseInt(session.client_reference_id, 10);
+
+          // ガード
+          if (!orderId) break;
+          if (session.mode !== 'payment') break;
+          if (session.payment_status !== 'paid') break;
+
+          // idempotency: すでに処理済み/別ステータスなら何もしない
+          const current = await wcGetOrder(orderId);
+          const curStatus = String(current.status || '');
+          if (curStatus === 'processing' || curStatus === 'completed') {
+            console.log(`[Webhook] order ${orderId} already ${curStatus}`);
+          } else {
+            await wcUpdateOrderStatus(orderId, 'processing');
+            console.log(`[Webhook] order ${orderId} -> processing`);
+          }
           break;
         }
+
         case 'checkout.session.expired': {
-          const session = event.data.object;
-          console.log('[Webhook] checkout.session.expired order=', session.client_reference_id);
-          // TODO: 在庫の解放など
+          const s = event.data.object;
+          console.log('[Webhook] expired order:', s.client_reference_id);
+          // 必要なら在庫解放や再送ロジック
           break;
         }
+
         default:
+          // 必要に応じて他イベントもハンドリング
           break;
       }
+
       res.json({ received: true });
     } catch (err) {
-      console.error('[Webhook Error]', err.message);
-      res.status(400).send(`Webhook Error: ${err.message}`);
+      // Woo 側の一時エラー時は 500 を返すと Stripe がリトライしてくれる
+      console.error('[Webhook Error]', err);
+      return res.status(500).send(`Webhook Error: ${err.message}`);
     }
   }
 );
 
-// ---------------- ここからは通常のJSON API ----------------------
+/* ---------------- それ以外のAPIは JSON でOK（Webhookより下に置く） ---------------- */
 app.use(express.json());
 
 app.get('/health', (_req, res) => res.send('ok'));
 
-// 成功ページからの照会（任意）
+// 決済ステータス照会API（成功ページから呼ぶ）
 app.get('/api/checkout-status', async (req, res) => {
   try {
-    const { cs } = req.query;
+    const { cs } = req.query; // 例: cs_live_a1B2...
     if (!cs) return res.status(400).json({ ok:false, error:'MISSING_CS' });
-    const s = await stripe.checkout.sessions.retrieve(cs, { expand:['payment_intent'] });
+
+    const session = await stripe.checkout.sessions.retrieve(cs, {
+      expand: ['payment_intent']
+    });
+
     res.json({
       ok: true,
-      orderId: s.client_reference_id,
-      amount: s.amount_total,
-      currency: s.currency,
-      payment_status: s.payment_status,
-      status: s.status,
+      orderId: session.client_reference_id,
+      amount: session.amount_total,
+      currency: session.currency,
+      payment_status: session.payment_status, // 'paid' | 'unpaid' | 'no_payment_required'
+      status: session.status,                 // 'complete' | 'open' | 'expired'
     });
   } catch (e) {
     console.error('[checkout-status]', e);
-    res.status(400).json({ ok:false, error: e.message });
+    res.status(400).json({ ok:false, error:e.message });
   }
 });
 
-// ★ 新規: Checkout URL を返すAPI（WPから内部コール）
-app.post('/api/orders/:orderId/checkout-url', apiKeyGuard, async (req, res) => {
-  try {
-    const { orderId } = req.params;
-    const { finalTotalJpy, short = false } = req.body || {};
-
-    const { url, sessionId } = await createCheckoutSession({
-      orderId,
-      finalTotalJpy: Number(finalTotalJpy),
-      expiresInSec: 60 * 60 * 24
-    });
-
-    if (short) {
-      const token = issueToken(5);
-      await saveShort(token, url, 60 * 60 * 24);
-      const shortBase = process.env.APP_SHORT_BASE_URL || process.env.APP_BASE_URL;
-      const shortUrl = `${shortBase}/p/${token}`;
-      return res.json({ ok: true, url, shortUrl, sessionId });
-    }
-
-    res.json({ ok: true, url, sessionId });
-  } catch (e) {
-    console.error('[checkout-url] error', e);
-    res.status(400).json({ ok:false, error: e.message || 'FAILED' });
-  }
-});
-
-// 既存: SMS送信API（従来運用を残す場合）
-// sendCheckoutLink.js 内のロジックで実装済み
-import { sendCheckoutLink } from './sendCheckoutLink.js';
+/**
+ * 注文確定→支払いリンク作成→SMS送信（既存継続）
+ *  POST /api/orders/1234/send-payment
+ *  { "finalTotalJpy": 5980, "phoneE164": "+81xxxxxxxxx" }
+ */
 app.post('/api/orders/:orderId/send-payment', async (req, res) => {
   try {
     const { orderId } = req.params;
     const { finalTotalJpy, phoneE164 } = req.body;
+
+    // ※ 本番では finalTotalJpy をサーバー側で再計算/検証して改ざん対策を！
     const url = await sendCheckoutLink({ orderId, finalTotalJpy, phoneE164 });
+
     res.json({ ok: true, url });
   } catch (e) {
     console.error('[SendPayment Error]', e);
     res.status(400).json({ ok: false, error: e.message || 'FAILED' });
-  }
-});
-
-// 短縮リンク解決（SMSを継続する場合用）
-app.get('/p/:token', async (req, res) => {
-  try {
-    const target = await loadShort(req.params.token);
-    if (!target) return res.status(404).send('Not found');
-    res.redirect(302, target);
-  } catch {
-    res.status(500).send('Error');
   }
 });
 
